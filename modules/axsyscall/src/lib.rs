@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod test;
+mod mem;
 use syscalls::Sysno;
 
 /** `add_two` 将指定值加2
