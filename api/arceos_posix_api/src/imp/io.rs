@@ -78,9 +78,28 @@ fn write_impl(fd: c_int, buf: *const c_void, count: usize) -> LinuxResult<ctypes
         return Err(LinuxError::EFAULT);
     }
     let src = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+    debug!(
+        "write start (fd={}, len={}): {:02x?}",
+        fd,
+        count,
+        &src[..count.min(64)]  // 最多显示前64字节
+    );
     #[cfg(feature = "fd")]
     {
         Ok(get_file_like(fd)?.write(src)? as ctypes::ssize_t)
+        // let file = get_file_like(fd)?;
+        // let ret = file.write(src)? as ctypes::ssize_t;
+        // file.seek(SeekFrom::Start(0))?;
+        // let mut buf = vec![0u8; count]; // 缓冲区大小和写入一样
+        // let n = file.read(&mut buf)?;
+        //
+        // debug!(
+        // "file read after write (fd={}, len={}): {:02x?}",
+        // fd,
+        // n,
+        // &buf[..n.min(64)] // 最多显示前64字节
+        // );
+        // Ok(ret)
     }
 
     #[cfg(not(feature = "fd"))]

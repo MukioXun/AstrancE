@@ -340,6 +340,10 @@ impl File {
     pub fn read_link(&self, buf: *mut c_char, bufsize: usize) -> AxResult<usize> {
         self.access_node(Cap::WRITE)?.read_link(buf, bufsize)
     }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
 }
 
 impl Directory {

@@ -18,6 +18,7 @@ use crate::ctypes::{off_t, size_t, ssize_t};
 use crate::{utils::check_and_read_user_ptr,utils::write_back_user_ptr,
             utils::copy_to_user, utils::copy_from_user};
 use axio::SeekFrom;
+use alloc::string::String;
 pub const AX_FILE_LIMIT: usize = 1024;
 
 static FILE_LIMIT: Mutex<(usize, usize)> = Mutex::new((AX_FILE_LIMIT, AX_FILE_LIMIT));
@@ -127,6 +128,16 @@ pub trait FileLike: Send + Sync {
     fn is_pipe(&self) -> bool {
         warn!("Unsupport is_pipe for this type");
         false
+    }
+
+    fn offset(&self) -> LinuxResult<u64> {
+        warn!("Unsupport seek for this type");
+        Ok(0)
+    }
+
+    fn flush(&self) -> LinuxResult<()> {
+        warn!("Unsupport seek for this type");
+        Ok(())
     }
 }
 
@@ -426,7 +437,7 @@ fn poll_once(fds: *mut ctypes::pollfd, nfds: ctypes::nfds_t) -> LinuxResult<usiz
     Ok(ready_count)
 }
 
-pub fn copy_file_range(
+/*pub fn copy_file_range(
     fd_in: c_int,
     off_in: Option<*mut off_t>,
     fd_out: c_int,
@@ -507,7 +518,267 @@ pub fn copy_file_range(
     }
 
     Ok(total_copied as isize)
+}*/
+
+pub fn copy_file_range(
+    fd_in: c_int,
+    off_in: Option<*mut off_t>,
+    fd_out: c_int,
+    off_out: Option<*mut off_t>,
+    size: size_t,
+    flags: u32,
+) -> Result<isize, LinuxError> {
+    if flags != 0 {
+        return Err(LinuxError::EINVAL);
+    }
+    if size == 0 {
+        return Ok(0);
+    }
+
+    let mut src = get_file_like(fd_in)?;
+    let mut dst = get_file_like(fd_out)?;
+
+    // 权限检查（建议启用）
+    // if !src.readable() || !dst.writable() {
+    //     return Err(LinuxError::EBADF);
+    // }
+
+    let mut in_pos: u64 = if let Some(ptr) = off_in {
+        let v = check_and_read_user_ptr(ptr)?;
+        if v < 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        v as u64
+    } else {
+        src.seek(SeekFrom::Current(0))?
+    };
+
+    let mut out_pos: u64 = if let Some(ptr) = off_out {
+        let v = check_and_read_user_ptr(ptr)?;
+        if v < 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        v as u64
+    } else {
+        dst.seek(SeekFrom::Current(0))?
+    };
+
+    // 常量和缓冲区
+    const CHUNK_SIZE: usize = 4096;
+    let mut buf = [0u8; CHUNK_SIZE];
+    let mut total_copied: usize = 0;
+    let mut remaining: usize = size;
+
+    // 输出初始文件信息
+    let in_size = src.seek(SeekFrom::End(0)).unwrap_or(0);
+    src.seek(SeekFrom::Start(in_pos))?;
+    let out_size = dst.seek(SeekFrom::End(0)).unwrap_or(0);
+    dst.seek(SeekFrom::Start(out_pos))?;
+    debug!("[copy_file_range] start: fd_in={} fd_out={} size={} flags={}", fd_in, fd_out, size, flags);
+    debug!("initial in_pos={} out_pos={} in_size={} out_size={}", in_pos, out_pos, in_size, out_size);
+
+    // 可选：输出输入文件的初始内容（限制长度）
+    let mut in_buf = vec![0u8; 64.min(in_size as usize)];
+    if in_size > 0 {
+        if let Ok(read) = src.read_at(&mut in_buf, in_pos) {
+            debug!("initial input content (offset={}): {:02x?}", in_pos, &in_buf[..read]);
+        }
+    }
+    let mut tmp = vec![0u8; 64];
+    let n = src.read_at(&mut tmp, 3)?;
+    debug!("probe src[3..3+{}): {:02x?}", n, &tmp[..n.min(64)]);
+
+    // 可选：输出输出文件的初始内容（限制长度）
+    let mut out_buf = vec![0u8; 64.min(out_size as usize)];
+    if out_size > 0 {
+        if let Ok(read) = dst.read_at(&mut out_buf, out_pos) {
+            debug!("initial output content (offset={}): {:02x?}", out_pos, &out_buf[..read]);
+        }
+    }
+
+    if out_pos > out_size {
+        let hole_size = out_pos - out_size;
+        let zero_buf = [0u8; 4096];
+        let mut remaining = hole_size;
+        let mut pos = out_size;
+
+        let mut wrote = 0usize;
+        while remaining > 0 {
+            let n = remaining.min(zero_buf.len() as u64) as usize;
+            let m = dst.write_at(&zero_buf[..n], pos)?;
+            debug!("padding: wrote {} bytes at pos={}", n, pos + wrote as u64);
+            if m == 0 {
+                debug!("EIO: cannot make progress");
+                return Err(LinuxError::EIO);
+            }
+            // 输出写入内容的十六进制表示（限制长度）
+            let display_len = m.min(64);
+            debug!("padding content (offset={}): {:02x?}", pos + wrote as u64, &buf[wrote..wrote + display_len]);
+            wrote += n;
+            pos += n as u64;
+            remaining -= n as u64;
+        }
+    }
+
+    let mut tmp = vec![0u8; size as usize];
+    let n = src.read_at(&mut tmp, in_pos)?;
+    debug!("src full dump from in_pos={}: {:02x?}", in_pos, &tmp[..n.min(64)]);
+
+    while remaining > 0 {
+        let to_copy = core::cmp::min(CHUNK_SIZE, remaining);
+        debug!("loop: remaining={} to_copy={} in_pos={} out_pos={}", remaining, to_copy, in_pos, out_pos);
+
+        // 读取数据并输出内容
+        let read_bytes = src.read_at(&mut buf[..to_copy], in_pos)?;
+        debug!("read_at: got {} bytes", read_bytes);
+        if read_bytes > 0 {
+            // 输出读取内容的十六进制表示（限制长度，例如前 64 字节）
+            let display_len = read_bytes.min(64);
+            debug!("read content (offset={}): {:02x?}", in_pos, &buf[..display_len]);
+            // 可选：尝试以 ASCII 形式输出（仅打印可打印字符）
+            // let ascii: String = buf[..read_bytes]
+            //     .iter()
+            //     .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            //     .collect();
+            // debug!("read content (ASCII, offset={}): {}", in_pos, ascii);
+        }
+        if read_bytes == 0 {
+            debug!("EOF reached, copied {} of {} bytes", total_copied, size);
+            break;
+        }
+
+        // 写入数据并输出内容
+        let mut wrote = 0usize;
+        while wrote < read_bytes {
+            let n = dst.write_at(&buf[wrote..read_bytes], out_pos + wrote as u64)?;
+            debug!("write_at: wrote {} bytes at pos={}", n, out_pos + wrote as u64);
+            if n == 0 {
+                debug!("EIO: cannot make progress");
+                return Err(LinuxError::EIO);
+            }
+            // 输出写入内容的十六进制表示（限制长度）
+            let display_len = n.min(64);
+            debug!("write content (offset={}): {:02x?}", out_pos + wrote as u64, &buf[wrote..wrote + display_len]);
+            wrote += n;
+        }
+
+        let wrote_u64 = u64::try_from(wrote).map_err(|_| LinuxError::EINVAL)?;
+        debug!("advance in_pos += {} out_pos += {}", wrote_u64, wrote_u64);
+        in_pos = in_pos.checked_add(wrote_u64).ok_or(LinuxError::EINVAL)?;
+        out_pos = out_pos.checked_add(wrote_u64).ok_or(LinuxError::EINVAL)?;
+        total_copied = total_copied.checked_add(wrote).ok_or(LinuxError::EINVAL)?;
+        remaining = remaining.checked_sub(wrote).unwrap_or(0);
+
+    }
+    debug!("final: total_copied={} in_pos={} out_pos={}", total_copied, in_pos, out_pos);
+
+    // 写回偏移量
+    if let Some(ptr) = off_in {
+        let out_i64 = i64::try_from(in_pos).map_err(|_| LinuxError::EINVAL)?;
+        write_back_user_ptr(ptr, out_i64)?;
+    } else {
+        src.seek(SeekFrom::Start(in_pos))?;
+    }
+    if let Some(ptr) = off_out {
+        let out_i64 = i64::try_from(out_pos).map_err(|_| LinuxError::EINVAL)?;
+        write_back_user_ptr(ptr, out_i64)?;
+    } else {
+        dst.seek(SeekFrom::Start(out_pos))?;
+    }
+
+    Ok(total_copied as isize)
 }
+
+
+/*pub fn copy_file_range(
+    fd_in: c_int,
+    off_in: Option<*mut off_t>,
+    fd_out: c_int,
+    off_out: Option<*mut off_t>,
+    size: size_t,
+    flags: u32,
+) -> Result<isize, LinuxError> {
+    if flags != 0 {
+        return Err(LinuxError::EINVAL);
+    }
+    if size == 0 {
+        return Ok(0);
+    }
+
+    let mut src = get_file_like(fd_in)?;
+    let mut dst = get_file_like(fd_out)?;
+
+    // 权限检查（可选）
+    // if !src.readable() || !dst.writable() {
+    //     return Err(LinuxError::EBADF);
+    // }
+
+    // 确定初始偏移
+    let mut in_pos: u64 = if let Some(ptr) = off_in {
+        let v = check_and_read_user_ptr(ptr)?;
+        if v < 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        v as u64
+    } else {
+        src.seek(SeekFrom::Current(0))?
+    };
+
+    let mut out_pos: u64 = if let Some(ptr) = off_out {
+        let v = check_and_read_user_ptr(ptr)?;
+        if v < 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        v as u64
+    } else {
+        dst.seek(SeekFrom::Current(0))?
+    };
+
+    const CHUNK_SIZE: usize = 4096;
+    let mut buf = [0u8; CHUNK_SIZE];
+    let mut total_copied = 0usize;
+    let mut remaining = size;
+
+    while remaining > 0 {
+        let to_copy = core::cmp::min(CHUNK_SIZE, remaining);
+
+        // 从输入文件读取
+        let read_bytes = src.read_at(&mut buf[..to_copy], in_pos)?;
+        if read_bytes == 0 {
+            break; // EOF
+        }
+
+        // 写入输出文件
+        let mut wrote = 0usize;
+        while wrote < read_bytes {
+            let n = dst.write_at(&buf[wrote..read_bytes], out_pos + wrote as u64)?;
+            if n == 0 {
+                return Err(LinuxError::EIO);
+            }
+            wrote += n;
+        }
+
+        in_pos += wrote as u64;
+        out_pos += wrote as u64;
+        total_copied += wrote;
+        remaining -= wrote;
+    }
+
+    // 回写用户提供的偏移量
+    if let Some(ptr) = off_in {
+        write_back_user_ptr(ptr, in_pos as i64)?;
+    } else {
+        src.seek(SeekFrom::Start(in_pos))?;
+    }
+    if let Some(ptr) = off_out {
+        write_back_user_ptr(ptr, out_pos as i64)?;
+    } else {
+        dst.seek(SeekFrom::Start(out_pos))?;
+    }
+
+    Ok(total_copied as isize)
+}*/
+
 
 pub fn splice(
     fd_in: c_int,

@@ -174,6 +174,15 @@ impl FileLike for File {
     fn seek(&self, pos: SeekFrom) -> LinuxResult<u64> {
         Ok(self.inner.lock().seek(pos)?)
     }
+
+    fn offset(&self) -> LinuxResult<u64> {
+        Ok(self.inner.lock().offset())
+    }
+
+    fn flush(&self) -> LinuxResult<()> {
+        self.inner.lock().flush();
+        Ok(())
+    }
 }
 
 fn get_c_string_length(name: *const c_char) -> usize {
